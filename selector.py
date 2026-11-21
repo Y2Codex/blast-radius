@@ -576,8 +576,15 @@ def change_tests(mp, path, ch, why):
 _SWAPS = {(ast.Is, ast.Eq), (ast.Eq, ast.Is), (ast.IsNot, ast.NotEq), (ast.NotEq, ast.IsNot)}
 
 
+# Enum classes of the pinned commit. A member is a singleton, so comparing a value with one by
+# `is` or by `==` agrees whenever the value is itself a member, which is how sqlglot uses them.
+ENUMS = {"TokenType", "DType", "Type", "ErrorLevel", "IsPredicatePrecedence", "PropertiesLocation", "ScopeType",
+         "TrieResult", "Dialects", "NormalizationStrategy", "AliasPrecedence", "UsingColumnOrder"}
+
+
 def identity_swap(ch):
-    """`x is None` <-> `x == None` (also True/False and enum members such as Kind.NAME) behave the same."""
+    """`x is None` <-> `x == None`, and the same against True, False or an enum member, behave the
+    same. Other upper-case attributes (string constants such as Drill.DATE_FORMAT) do not."""
     if (type(ch.node), type(ch.new)) not in _SWAPS or not ch.chain:
         return False
     cmp_, field = ch.chain[-1]
@@ -586,9 +593,10 @@ def identity_swap(ch):
     for side in (cmp_.comparators[0], cmp_.left):
         if isinstance(side, ast.Constant) and (side.value is None or side.value is True or side.value is False):
             return True
-        if (isinstance(side, ast.Attribute) and isinstance(side.value, (ast.Name, ast.Attribute))
-                and side.attr.isupper() and (side.value.id if isinstance(side.value, ast.Name) else side.value.attr)[:1].isupper()):
-            return True
+        if isinstance(side, ast.Attribute) and isinstance(side.value, (ast.Name, ast.Attribute)) and side.attr.isupper():
+            owner = side.value.id if isinstance(side.value, ast.Name) else side.value.attr
+            if owner in ENUMS:
+                return True
     return False
 
 

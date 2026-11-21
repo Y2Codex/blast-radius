@@ -54,14 +54,18 @@ def scan(rel, tree):
             return
         if isinstance(node, ast.stmt):
             stmt = node
-        name = None
+        names = ()
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
-            name = node.id
+            names = (node.id,)
         elif isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
-            name = node.attr
+            names = (node.attr,)
         elif isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.isidentifier():
-            name = node.value  # getattr(x, "NAME") style access
-        if name is not None:
+            names = (node.value,)  # getattr(x, "NAME") style access
+        elif isinstance(node, ast.ImportFrom):
+            names = [a.name for a in node.names]  # `from m import NAME` reads m.NAME
+        elif isinstance(node, ast.Import):
+            names = [part for a in node.names for part in a.name.split(".")]
+        if names:
             if fmask is None:
                 m = 0
                 if stmt is not None:
@@ -70,7 +74,8 @@ def scan(rel, tree):
             else:
                 m = fmask
             if m:
-                refs[name] = refs.get(name, 0) | m
+                for name in names:
+                    refs[name] = refs.get(name, 0) | m
         for k in ast.iter_child_nodes(node):
             visit(k, fmask, stmt)
 
