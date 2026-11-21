@@ -529,6 +529,20 @@ def read_repo(path):
         return None
 
 
+def source_readers(mp, path):
+    """Tests that read a Python file as text instead of only importing it, so no executed line
+    ties them to a change. The tracer cannot tell such a read from an import, so the readers
+    are listed here from the test sources at the pinned commit: tests/test_typing.py parses
+    every sqlglot/typing/*.py and compares the code objects of the annotators they define."""
+    if not path.startswith("sqlglot/typing/"):
+        return 0
+    m = 0
+    for i, tid in enumerate(mp.tests):
+        if tid.startswith("tests/test_typing.py::"):
+            m |= 1 << i
+    return m
+
+
 def py_file_tests(mp, path, old_text, new_text, why):
     if path not in mp.lines:
         why.append("unexecuted-file")
@@ -584,6 +598,8 @@ def patch_tests(mp, text, why):
                         m |= mp.file_any(old)
                         w.append("rename")
                     m |= mp.open(path)
+                    if "ast-equal" not in w:
+                        m |= source_readers(mp, path)
                 else:
                     m = mp.open(path)
                     if new_text == old_text:
