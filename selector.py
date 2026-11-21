@@ -106,21 +106,52 @@ class Map:
 
 
 def parse_patch(text):
-    """-> {path: (old_path_or_None, new_path_or_None, [hunks])}; hunk = (old_start, [(tag, line)])"""
-    files = {}
+    """-> [(old_path_or_None, new_path_or_None, [hunks], flags)]; hunk = (old_start, [(tag, line, has_newline)]).
+
+    Reads `diff --git` headers as well as ---/+++ pairs, so entries without hunks (pure renames,
+    binary files, deleted or added empty files, mode changes) are not lost."""
+    entries = []
     cur = None
-    old = new = None
     lines = text.split("\n")
     i, n = 0, len(lines)
+
+    def entry(o, nw):
+        e = {"old": o, "new": nw, "hunks": [], "flags": set(), "hdr": False}
+        entries.append(e)
+        return e
+
     while i < n:
         ln = lines[i]
+        if ln.startswith("diff --git "):
+            o, nw = _git_paths(ln[11:])
+            cur = entry(o, nw)
+            i += 1
+            continue
         if ln.startswith("--- ") and i + 1 < n and lines[i + 1].startswith("+++ "):
-            old = _path(ln[4:])
-            new = _path(lines[i + 1][4:])
-            cur = []
-            files[new or old] = (old, new, cur)
+            if cur is None or cur["hdr"]:
+                cur = entry(None, None)
+            cur["old"] = _path(ln[4:])
+            cur["new"] = _path(lines[i + 1][4:])
+            cur["hdr"] = True
             i += 2
             continue
+        if cur is not None and not cur["hunks"]:
+            if ln.startswith("deleted file mode"):
+                cur["new"] = None
+                cur["flags"].add("deleted")
+            elif ln.startswith("new file mode"):
+                cur["old"] = None
+                cur["flags"].add("added")
+            elif ln.startswith("rename from "):
+                cur["old"] = _path(ln[12:])
+            elif ln.startswith("rename to "):
+                cur["new"] = _path(ln[10:])
+            elif ln.startswith(("copy from ", "copy to ")):
+                cur["flags"].add("copy")
+            elif ln.startswith(("GIT binary patch", "Binary files ")):
+                cur["flags"].add("binary")
+            elif ln.startswith(("old mode ", "new mode ")):
+                cur["flags"].add("mode")
         if ln.startswith("@@") and cur is not None:
             parts = ln.split()
             o = parts[1][1:].split(",")
@@ -152,14 +183,29 @@ def parse_patch(text):
                 if body:
                     body[-1] = (body[-1][0], body[-1][1], False)
                 i += 1
-            cur.append((ostart, body))
+            cur["hunks"].append((ostart, body))
             continue
         i += 1
-    return files
+    return [(e["old"], e["new"], e["hunks"], e["flags"]) for e in entries if e["old"] or e["new"]]
+
+
+def _git_paths(rest):
+    """Both paths of a `diff --git a/X b/Y` line."""
+    rest = rest.strip()
+    mid = len(rest) // 2
+    if len(rest) > 4 and rest[mid] == " " and rest[:mid][2:] == rest[mid + 1:][2:]:
+        return _path(rest[:mid]), _path(rest[mid + 1:])
+    for sep in (' "b/', " b/"):
+        k = rest.find(sep)
+        if k > 0:
+            return _path(rest[:k]), _path(rest[k + 1:])
+    return None, None
 
 
 def _path(s):
     s = s.split("\t")[0].strip()
+    if len(s) > 1 and s[0] == '"' and s[-1] == '"':
+        s = s[1:-1]
     if s == "/dev/null":
         return None
     if s.startswith(("a/", "b/")):
@@ -220,7 +266,7 @@ def diff_nodes(o, n, chain, out):
         elif isinstance(vo, ast.AST) or isinstance(vn, ast.AST):
             out.append(Change(vo if isinstance(vo, ast.AST) else o, chain + ([(o, field)] if isinstance(vo, ast.AST) else [])))
         elif vo != vn or type(vo) is not type(vn):
-            out.append(Change(o, chain))
+            out.append(Change(o, chain, new=n))
 
 
 def diff_lists(o, field, vo, vn, chain, out):
@@ -329,7 +375,7 @@ def expr_class_users(mp, node):
     return r
 
 
-def import_time_tests(mp, path, stmt, chain, changed_node, why):
+def import_time_tests(mp, path, stmt, chain, changed_node, why, new_node=None):
     """Tests affected by a change to code that runs at import (module / class level)."""
     a, b = own_lines(stmt)
     loaders = mp.line(path, a, b)
@@ -350,9 +396,14 @@ def import_time_tests(mp, path, stmt, chain, changed_node, why):
             tests &= users
             why.append("class-users")
     # dict entry keyed by an expression class
-    entry = dict_entry_key(stmt, changed_node, chain)
+    entry = dict_entry_key(stmt, changed_node)
     if entry is not None:
-        u = expr_class_users(mp, entry)
+        key, in_key = entry
+        u = expr_class_users(mp, key)
+        if u is not None and in_key:
+            # the key itself changed: the entry now answers for another class as well
+            nu = expr_class_users(mp, new_node) if new_node is not None else None
+            u = None if nu is None else u | nu
         if u is not None:
             tests &= u
             why.append("dict-key")
@@ -371,20 +422,19 @@ def import_time_tests(mp, path, stmt, chain, changed_node, why):
     return tests
 
 
-def dict_entry_key(stmt, changed_node, chain):
-    """Key node of the dict entry containing changed_node, when stmt assigns a dict literal."""
+def dict_entry_key(stmt, changed_node):
+    """(key node, change is inside the key) for the dict entry holding changed_node, when stmt
+    assigns a dict literal. None when the change is not inside exactly one entry."""
     value = getattr(stmt, "value", None)
-    if not isinstance(value, ast.Dict):
+    if not isinstance(value, ast.Dict) or not isinstance(changed_node, ast.AST):
         return None
-    line = getattr(changed_node, "lineno", None)
-    if line is None:
-        return None
-    end = getattr(changed_node, "end_lineno", line)
     for k, v in zip(value.keys, value.values):
         if k is None:
             continue
-        if k.lineno <= line and end <= (v.end_lineno or v.lineno):
-            return k
+        if any(x is changed_node for x in ast.walk(k)):
+            return k, True
+        if any(x is changed_node for x in ast.walk(v)):
+            return k, False
     return None
 
 
@@ -489,7 +539,7 @@ def change_tests(mp, path, ch, why):
         entered = func_start_mask(mp, path, fn)
         lm = mp.line(path, a, b)
         return entered & lm if entered else lm
-    return import_time_tests(mp, path, stmt, outer, node, why)
+    return import_time_tests(mp, path, stmt, outer, node, why, ch.new)
 
 
 _SWAPS = {(ast.Is, ast.Eq), (ast.Eq, ast.Is), (ast.IsNot, ast.NotEq), (ast.NotEq, ast.IsNot)}
@@ -529,18 +579,121 @@ def read_repo(path):
         return None
 
 
-def source_readers(mp, path):
-    """Tests that read a Python file as text instead of only importing it, so no executed line
-    ties them to a change. The tracer cannot tell such a read from an import, so the readers
-    are listed here from the test sources at the pinned commit: tests/test_typing.py parses
-    every sqlglot/typing/*.py and compares the code objects of the annotators they define."""
-    if not path.startswith("sqlglot/typing/"):
-        return 0
+def tests_where(mp, pred):
     m = 0
     for i, tid in enumerate(mp.tests):
-        if tid.startswith("tests/test_typing.py::"):
+        if pred(tid):
             m |= 1 << i
     return m
+
+
+def tests_under(mp, d):
+    """Tests whose file lives in directory d ("" is the repository root)."""
+    return mp.all if not d else tests_where(mp, lambda t: t.startswith(d + "/"))
+
+
+# Names a new top-level module or package would hide from every test process: the checkout is
+# on PYTHONPATH ahead of the standard library and of the installed packages.
+STARTUP = {"sitecustomize", "usercustomize", "pytest", "_pytest", "pluggy", "iniconfig", "packaging",
+           "sqlglot", "tests", "duckdb", "pandas", "numpy", "dateutil", "pytz", "setuptools", "mypyc"}
+PYTEST_FILES = {"pytest.ini": None, ".pytest.ini": None, "tox.ini": ("[pytest]",),
+                "setup.cfg": ("[tool:pytest]",), "pyproject.toml": ("[tool.pytest",)}
+
+
+def pytest_config(base, text):
+    """The part of a config file pytest reads, comments and blank lines dropped."""
+    heads = PYTEST_FILES[base]
+    keep, on = [], heads is None
+    for ln in (text or "").split("\n"):
+        t = ln.strip()
+        if not t or t[0] in "#;":
+            continue
+        if t.startswith("["):
+            on = heads is None or t.startswith(heads)
+        if on:
+            keep.append(t)
+    return keep
+
+
+def coding_cookie(text):
+    import re
+    for ln in (text or "").split("\n")[:2]:
+        m = re.match(r"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)", ln)
+        if m:
+            return m.group(1)
+    return None
+
+
+def structural_tests(mp, old, new, old_text, new_text, semantic, w):
+    """Tests tied to a file by something other than executed lines. These links are read off
+    the test sources and the layout of the pinned commit, where the tracer cannot see them:
+
+    - tests/test_typing.py parses every sqlglot/typing/*.py as text and imports each module;
+    - tests/test_sqlglotc.py runs sqlglotc/setup.py with runpy;
+    - pytest reads conftest.py files and its own sections of the config files at the root;
+    - a package stops importing when its __init__.py goes, and a new package or top-level
+      module can hide an existing module of the same name.
+    """
+    m = 0
+    gone = old if (new is None or (old and new and old != new)) else None
+    born = new if (old is None or (old and new and old != new)) else None
+    for p in {x for x in (old, new) if x}:
+        d, _, base = p.rpartition("/")
+        if semantic and p.endswith(".py") and p.startswith("sqlglot/typing/"):
+            m |= tests_where(mp, lambda t: t.startswith("tests/test_typing.py::"))
+            w.append("typing-source")
+        if semantic and (p.startswith("sqlglotc/") or p == "tests/test_sqlglotc.py"):
+            m |= tests_where(mp, lambda t: t.startswith("tests/test_sqlglotc.py::"))
+            w.append("sqlglotc")
+        if semantic and base == "conftest.py":
+            m |= tests_under(mp, d)
+            w.append("conftest")
+        if not d and base in PYTEST_FILES:
+            if pytest_config(base, old_text if p == old else None) != pytest_config(base, new_text if p == new else None):
+                m |= mp.all
+                w.append("pytest-config")
+    if gone and gone.endswith("/__init__.py"):
+        d = gone.rpartition("/")[0]
+        if d == "tests" or d.startswith("tests/"):
+            m |= tests_under(mp, d)
+        for f in mp.lines:
+            if f.startswith(d + "/"):
+                m |= mp.file_any(f)
+        w.append("package-gone")
+    if born and born.endswith(".py"):
+        parts = born.split("/")
+        if parts[-1] == "__init__.py" and len(parts) > 1:
+            shadowed = "/".join(parts[:-1]) + ".py"
+            if shadowed in mp.lines:
+                m |= mp.file_any(shadowed)
+                w.append("shadows-module")
+            parts = parts[:-1]
+        if len(parts) == 1:
+            stem = parts[0][:-3] if parts[0].endswith(".py") else parts[0]
+            if stem in STARTUP or stem in getattr(sys, "stdlib_module_names", ()):
+                m |= mp.all
+                w.append("shadows-import")
+    if new and new.endswith(".py") and new_text is not None and coding_cookie(new_text) != coding_cookie(old_text):
+        m |= mp.file_any(old or new) | (mp.all if (old or new) not in mp.lines and new.startswith(("sqlglot/", "tests/")) else 0)
+        w.append("coding-cookie")
+    return m
+
+
+def own_tests(mp, path, changes):
+    """A change inside `class C: def test_x` of a test file can fail C::test_x whether or not
+    the map saw that test run the changed line (it may have errored during setup when traced)."""
+    want = set()
+    for ch in changes:
+        nodes = [n for n, _ in ch.chain]
+        nodes.append(ch.node[0] if ch.kind == "insert" else ch.node)
+        cls = None
+        for n in nodes:
+            if isinstance(n, ast.ClassDef) and cls is None:
+                cls = n.name
+            elif isinstance(n, DEFS) and cls is not None:
+                want.add(f"{path}::{cls}::{n.name}")
+                break
+    return tests_where(mp, lambda t: t in want) if want else 0
 
 
 def py_file_tests(mp, path, old_text, new_text, why):
@@ -568,6 +721,52 @@ def py_file_tests(mp, path, old_text, new_text, why):
     m = 0
     for ch in changes:
         m |= change_tests(mp, path, ch, why)
+    if path.startswith("tests/"):
+        m |= own_tests(mp, path, changes)
+    return m
+
+
+def file_tests(mp, old, new, hunks, flags, w):
+    if "copy" in flags:
+        old_text, old = read_repo(old) if old else "", None  # a copy leaves its source in place
+        old_text = old_text or ""
+    else:
+        old_text = read_repo(old) if old else ""
+    path = old or new
+    renamed = bool(old and new and old != new)
+    if old and old_text is None:
+        # not a text file of the pinned commit: anything that touched it
+        w.append("missing-old")
+        new_text = None
+        changed = semantic = True
+        m = mp.open(path) | mp.file_any(path)
+    elif "binary" in flags:
+        w.append("binary")
+        new_text = None
+        changed = semantic = True
+        m = mp.open(path) | mp.file_any(path)
+    else:
+        new_text = apply_hunks(old_text, hunks) if new else None
+        changed = new is None or old is None or renamed or new_text != old_text
+        m = 0
+        if path.endswith(".py"):
+            if old is None:
+                w.append("new-file")
+            else:
+                m = py_file_tests(mp, path, old_text, new_text, w)
+            if changed:
+                m |= mp.open(path)
+            semantic = changed and "ast-equal" not in w
+        else:
+            if changed:
+                m = mp.open(path)
+            w.append("data-file")
+            semantic = changed
+    if renamed:
+        m |= mp.file_any(old) | mp.open(old)
+        w.append("rename")
+    if changed:
+        m |= structural_tests(mp, old, new, old_text, new_text, semantic, w)
     return m
 
 
@@ -579,36 +778,17 @@ def patch_tests(mp, text, why):
         return mp.all
     if not files:
         why.append("no-files")
-        return 0
+        return mp.all if text.strip() else 0
     total = 0
-    for key, (old, new, hunks) in files.items():
+    for old, new, hunks, flags in files:
         path = old or new
         w = []
         try:
-            old_text = read_repo(old) if old else ""
-            if old and old_text is None:
-                # unknown file: anything that opened it
-                m = mp.open(path) | mp.file_any(path)
-                w.append("missing-old")
-            else:
-                new_text = apply_hunks(old_text, hunks) if new else None
-                if path.endswith(".py"):
-                    m = py_file_tests(mp, path, old_text, new_text, w)
-                    if new and old and new != old:
-                        m |= mp.file_any(old)
-                        w.append("rename")
-                    m |= mp.open(path)
-                    if "ast-equal" not in w:
-                        m |= source_readers(mp, path)
-                else:
-                    m = mp.open(path)
-                    if new_text == old_text:
-                        m = 0
-                    w.append("data-file")
+            m = file_tests(mp, old, new, hunks, flags, w)
         except Exception as e:
             w.append(f"error:{e!r}")
             m = mp.file_any(path) | mp.open(path)
-            if not m and path.startswith(("sqlglot/", "tests/")):
+            if not m and path.startswith(("sqlglot/", "tests/", "sqlglotc/")):
                 m = mp.all
         why.append(f"{path}[{','.join(w)}]={bin(m).count('1')}")
         total |= m
