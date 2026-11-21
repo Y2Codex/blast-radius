@@ -252,6 +252,30 @@ def _dump(n):
     return ast.dump(n) if isinstance(n, ast.AST) else repr(n)
 
 
+_PLAIN = (str, bytes, int, bool, type(None))
+
+
+def node_eq(a, b):
+    """Same tree, positions aside: what comparing ast.dump() of both would say, without building the strings."""
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, ast.AST):
+        for f in a._fields:
+            if not node_eq(getattr(a, f, None), getattr(b, f, None)):
+                return False
+        return True
+    if isinstance(a, list):
+        if len(a) != len(b):
+            return False
+        for x, y in zip(a, b):
+            if not node_eq(x, y):
+                return False
+        return True
+    if isinstance(a, _PLAIN):
+        return a == b
+    return repr(a) == repr(b)
+
+
 def diff_nodes(o, n, chain, out):
     if type(o) is not type(n):
         out.append(Change(o, chain, new=n))
@@ -261,23 +285,19 @@ def diff_nodes(o, n, chain, out):
         if isinstance(vo, list) and isinstance(vn, list):
             diff_lists(o, field, vo, vn, chain, out)
         elif isinstance(vo, ast.AST) and isinstance(vn, ast.AST):
-            if _dump(vo) != _dump(vn):
+            if not node_eq(vo, vn):
                 diff_nodes(vo, vn, chain + [(o, field)], out)
         elif isinstance(vo, ast.AST) or isinstance(vn, ast.AST):
             out.append(Change(vo if isinstance(vo, ast.AST) else o, chain + ([(o, field)] if isinstance(vo, ast.AST) else [])))
-        elif vo != vn or type(vo) is not type(vn):
+        elif not node_eq(vo, vn):
             out.append(Change(o, chain, new=n))
 
 
 def diff_lists(o, field, vo, vn, chain, out):
-    do = [_dump(x) for x in vo]
-    dn = [_dump(x) for x in vn]
-    if do == dn:
-        return
     sub = chain + [(o, field)]
     if len(vo) == len(vn):
-        for a, b, x, y in zip(vo, vn, do, dn):
-            if x != y:
+        for a, b in zip(vo, vn):
+            if not node_eq(a, b):
                 if isinstance(a, ast.AST) and isinstance(b, ast.AST):
                     diff_nodes(a, b, sub, out)
                 else:
@@ -287,10 +307,21 @@ def diff_lists(o, field, vo, vn, chain, out):
     if not is_stmts:
         out.append(Change(o, chain))
         return
+    # only the statements between the common head and tail need aligning
+    p = 0
+    top = min(len(vo), len(vn))
+    while p < top and node_eq(vo[p], vn[p]):
+        p += 1
+    q = 0
+    while q < top - p and node_eq(vo[-1 - q], vn[-1 - q]):
+        q += 1
+    do = [_dump(x) for x in vo[p:len(vo) - q]]
+    dn = [_dump(x) for x in vn[p:len(vn) - q]]
     sm = SequenceMatcher(None, do, dn, autojunk=False)
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
         if tag == "equal":
             continue
+        i1, i2, j1, j2 = i1 + p, i2 + p, j1 + p, j2 + p
         if tag == "replace" and i2 - i1 == j2 - j1:
             for a, b in zip(vo[i1:i2], vn[j1:j2]):
                 diff_nodes(a, b, sub, out)
@@ -713,7 +744,7 @@ def py_file_tests(mp, path, old_text, new_text, why):
     except (SyntaxError, ValueError):
         why.append("syntax-error")
         return mp.file_any(path)
-    if ast.dump(old_tree) == ast.dump(new_tree):
+    if node_eq(old_tree, new_tree):
         why.append("ast-equal")
         return 0
     changes = []
