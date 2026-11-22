@@ -21,18 +21,28 @@ syntax trees:
 - A lambda: tests that called it.
 - Class or module level code: tests that loaded the module, used the class, and read the changed name.
 - A data file: tests that opened it.
-- `is` / `==` swaps against `None`, `True`, `False` or an enum member: treated as no change.
+- A statement inserted into a function: tests that ran both of its neighbours (the only ones that can reach it).
+- `is` / `==` swaps against `None` or an enum member: treated as no change.
+
+When the selection is cheap to run (estimated CPU under 80% of what the scorer would charge for
+it) and the patch changes Python code but no fixture, the selector runs it against the patched
+checkout: a symlink farm over `/opt/sqlglot` in `/tmp` with the patched files written in, tests
+run with `unittest` in a forked child (every sqlglot test is a `unittest.TestCase`), cheapest and
+closest-named tests first, stopping at the first failure. All pass: nothing is selected. A
+failure: the selection stands, less the tests seen passing. A timeout or any doubt keeps the
+selection. Process pools in the tests get one forked worker instead of spawned ones.
 
 Selected tests are packed longest-first onto the worker count that minimises
 busiest worker + 2 s per worker.
 
-No test is run at decision time, and nothing is looked up by patch.
+Nothing is looked up by patch.
 
 ## Files
 
 | | |
 | --- | --- |
-| `Dockerfile` | Base image from the kit; fetches sqlglot at the pinned commit. |
+| `Dockerfile` | Base image from the kit; installs `requirements.lock`, fetches and byte-compiles sqlglot at the pinned commit. |
+| `requirements.lock` | The kit's package set, so tests run here as they did when the commits were labeled. |
 | `selector.py` | The selector. |
 | `map.bin` | The recorded map (zlib-compressed pickle). |
 | `fetch_sqlglot.py` | Build step that unpacks the pinned sqlglot into `/opt/sqlglot`. |

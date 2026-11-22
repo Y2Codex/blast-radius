@@ -11,7 +11,7 @@ with tarfile.open(fileobj=io.BytesIO(data)) as tar:
         if len(parts) < 2 or not m.isfile():
             continue
         rel = parts[1]
-        if rel.endswith((".gz", ".png", ".jpg", ".svg", ".parquet")):
+        if rel.endswith((".png", ".jpg", ".svg")):
             continue
         path = os.path.join(DEST, rel)
         os.makedirs(os.path.dirname(path), exist_ok=True)

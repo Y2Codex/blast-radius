@@ -255,10 +255,33 @@ def _dump(n):
 _PLAIN = (str, bytes, int, bool, type(None))
 
 
+_SRC = [None, None]  # lines of the old and the new file, for _same_text
+
+
+def _seg(lines, n):
+    a, b = n.lineno - 1, n.end_lineno - 1
+    if a == b:
+        return lines[a][n.col_offset:n.end_col_offset]
+    return "\n".join([lines[a][n.col_offset:]] + lines[a + 1:b] + [lines[b][:n.end_col_offset]])
+
+
+def _same_text(a, b):
+    """A statement spelled exactly the same parses to the same tree."""
+    o, w = _SRC
+    if o is None or w is None:
+        return False
+    try:
+        return _seg(o, a) == _seg(w, b)
+    except (AttributeError, TypeError, IndexError):
+        return False
+
+
 def node_eq(a, b):
     """Same tree, positions aside: what comparing ast.dump() of both would say, without building the strings."""
     if type(a) is not type(b):
         return False
+    if isinstance(a, ast.stmt) and _same_text(a, b):
+        return True
     if isinstance(a, ast.AST):
         for f in a._fields:
             if not node_eq(getattr(a, f, None), getattr(b, f, None)):
@@ -485,7 +508,22 @@ def change_tests(mp, path, ch, why):
         fn = innermost_func(chain)
         if fn is not None:
             why.append("insert-in-func")
-            return func_start_mask(mp, path, fn)
+            entered = func_start_mask(mp, path, fn)
+            # Only a test that reached the insertion point can run the new code, and in the
+            # original such a test ran both neighbours. Neighbours without bytecode of their own
+            # leave nothing to go by; an empty answer falls back to every caller.
+            reach = None
+            for a in anchors:
+                if isinstance(a, (ast.Global, ast.Nonlocal, ast.Pass, ast.Try, ast.TryStar)) or (
+                        isinstance(a, ast.Expr) and isinstance(a.value, ast.Constant)):
+                    continue
+                x, y = own_lines(a)
+                lm = mp.line(path, x, y)
+                reach = lm if reach is None else reach & lm
+            if reach and entered & reach:
+                why.append("reach")
+                return entered & reach
+            return entered
         m = 0
         for a in anchors:
             x, y = own_lines(a)
@@ -753,6 +791,7 @@ def py_file_tests(mp, path, old_text, new_text, why):
     except (SyntaxError, ValueError):
         why.append("syntax-error")
         return mp.file_any(path)
+    _SRC[0], _SRC[1] = old_text.split("\n"), new_text.split("\n")
     if node_eq(old_tree, new_tree):
         why.append("ast-equal")
         return 0
@@ -766,7 +805,9 @@ def py_file_tests(mp, path, old_text, new_text, why):
     return m
 
 
-def file_tests(mp, old, new, hunks, flags, w):
+def file_tests(mp, old, new, hunks, flags, w, tree=None):
+    """tree, when given, collects the patched checkout: path -> new text, or None for a removed
+    file; tree["!"] marks a patch the selector cannot reproduce as text (binary, unreadable)."""
     if "copy" in flags:
         old_text, old = read_repo(old) if old else "", None  # a copy leaves its source in place
         old_text = old_text or ""
@@ -807,25 +848,42 @@ def file_tests(mp, old, new, hunks, flags, w):
         w.append("rename")
     if changed:
         m |= structural_tests(mp, old, new, old_text, new_text, semantic, w)
+    if tree is not None:
+        if "missing-old" in w or "binary" in w or "mode" in flags or (new and new_text is None):
+            tree["!"] = True
+        else:
+            if old and old != new:
+                tree[old] = None
+            if new:
+                tree[new] = new_text
     return m
 
 
-def patch_tests(mp, text, why):
+def patch_tests(mp, text, why, tree=None):
+    if tree is None:
+        tree = {}
     try:
         files = parse_patch(text)
     except Exception as e:  # malformed patch: be safe
         why.append(f"parse-error:{e!r}")
+        tree["!"] = True
         return mp.all
     if not files:
         why.append("no-files")
+        tree["!"] = True
         return mp.all if text.strip() else 0
     total = 0
     for old, new, hunks, flags in files:
         path = old or new
         w = []
         try:
-            m = file_tests(mp, old, new, hunks, flags, w)
+            m = file_tests(mp, old, new, hunks, flags, w, tree)
+            if not path.endswith(".py") and "data-file" in w:
+                tree.setdefault("data", set()).add(path)
+            elif path.endswith(".py"):
+                tree["py"] = True
         except Exception as e:
+            tree["!"] = True
             w.append(f"error:{e!r}")
             m = mp.file_any(path) | mp.open(path)
             if not m and path.startswith(("sqlglot/", "tests/", "sqlglotc/")):
@@ -857,6 +915,233 @@ def pack(items):
     return best[1]
 
 
+# ------------------------------------------------------------------- verification
+#
+# A selection the map cannot narrow further may still break nothing: the edit can leave every
+# result the same. When the selection is cheap, run it against the patched checkout and keep
+# only what fails. The checkout is a symlink farm over REPO with the patched files written in;
+# the tests run with unittest (every sqlglot test is a unittest.TestCase) in a forked child.
+
+META = ("!", "data", "py")
+VERIFY_MAX_MS = int(os.environ.get("BR_VERIFY_MAX_MS", "6000"))   # recorded seconds of the selection
+VERIFY_BUDGET_S = float(os.environ.get("BR_VERIFY_BUDGET_S", "110"))  # wall clock for all verifying
+VERIFY = os.environ.get("BR_VERIFY", "1") == "1"
+TMP = os.environ.get("BR_TMP", "/tmp")
+
+
+VERIFY_SHARE = float(os.environ.get("BR_VERIFY_SHARE", "0.8"))
+POOLED = ("tests/test_optimizer.py", "tests/test_executor.py")  # run through process pools
+
+
+def verify_cost(items, num_id):
+    """Rough CPU ms to run items here: pooled tests were timed with parallel workers, and their
+    class set-up (duckdb, the pool) costs about a second."""
+    ms = 200
+    pooled = False
+    for t, n in items:
+        if num_id[n].startswith(POOLED):
+            ms += 4 * t
+            pooled = True
+        else:
+            ms += t
+    return ms + (1000 if pooled else 0)
+
+
+def ci_cost(items):
+    """What the scorer charges for running items as pack() splits them."""
+    ms = dict((n, t) for t, n in items)
+    w = pack(items)
+    return max(sum(ms[n] for n in b) for b in w) + WORKER_MS * len(w) if w else 0
+
+
+def _near(tid, stems):
+    """Is the test about one of the patched modules (tsql.py -> test_tsql.py, or test_<stem>)?"""
+    f = tid.split("::")
+    base = os.path.basename(f[0])[5:-3]
+    return base in stems or any(f[-1] == "test_" + st for st in stems)
+
+
+def build_farm(dst, files):
+    """Mirror REPO at dst with symlinks; directories on the way to a patched file are real."""
+    dirs = set()
+    for rel in files:
+        parts = rel.split("/")
+        for i in range(1, len(parts)):
+            dirs.add("/".join(parts[:i]))
+    os.makedirs(dst)
+
+    def fill(rel):
+        src = os.path.join(REPO, rel) if rel else REPO
+        try:
+            names = os.listdir(src)
+        except OSError:
+            names = []
+        for nm in names:
+            r = f"{rel}/{nm}" if rel else nm
+            if r in files:
+                continue
+            if r in dirs and os.path.isdir(os.path.join(src, nm)):
+                os.mkdir(os.path.join(dst, r))
+                fill(r)
+            else:
+                os.symlink(os.path.join(src, nm), os.path.join(dst, r))
+
+    fill("")
+    for rel, txt in files.items():
+        if txt is None:
+            continue
+        p = os.path.join(dst, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8", newline="") as f:
+            f.write(txt)
+
+
+def _child_run(farm, ids):
+    """In the forked child: run ids (cheapest first) until one fails.
+    -> {"bad": ids that failed, "ok": ids that ran and passed}."""
+    import importlib
+    import unittest
+
+    os.chdir(farm)
+    sys.path[:0] = [farm]
+    os.environ["PYTHONPATH"] = farm
+    # tests that start process pools (TestOptimizer) get one worker, forked from this child
+    # instead of spawned: it inherits the patched modules already loaded here.
+    os.cpu_count = lambda: 1
+    os.process_cpu_count = lambda: 1
+    import multiprocessing
+    _get = multiprocessing.get_context
+    multiprocessing.get_context = lambda method=None: _get("fork" if method in (None, "spawn", "forkserver") else method)
+
+    by_name = {}
+    bad, ok = set(), set()
+    groups = {}  # (file, class) -> cases, in the order given (cheapest first)
+    for tid in ids:
+        f, cls, meth = tid.split("::")
+        mod = f[:-3].replace("/", ".")
+        try:
+            case = getattr(importlib.import_module(mod), cls)(meth)
+        except BaseException:
+            return {"bad": [tid], "ok": []}  # the file cannot be imported: that test fails
+        by_name[case.id()] = tid
+        groups.setdefault((f, cls), []).append(case)
+
+    class Result(unittest.TestResult):
+        def _tid(self, test):
+            tid = by_name.get(test.id())
+            if tid is None:
+                inner = getattr(test, "test_case", None)
+                tid = by_name.get(inner.id()) if inner is not None else None
+            if tid is None:
+                raise RuntimeError("fixture error")  # setUpClass/setUpModule: give up
+            return tid
+
+        def _mark(self, test):
+            bad.add(self._tid(test))
+            self.stop()  # one failure settles it: the selection stands
+
+        def addError(self, test, err):
+            self._mark(test)
+
+        def addFailure(self, test, err):
+            self._mark(test)
+
+        def addSubTest(self, test, subtest, err):
+            if err is not None:
+                self._mark(test)
+
+        def addUnexpectedSuccess(self, test):
+            self._mark(test)
+
+        def addSuccess(self, test):
+            ok.add(self._tid(test))
+
+        def addSkip(self, test, reason):
+            ok.add(self._tid(test))
+
+    t_imp = os.times()
+    suite = unittest.TestSuite([c for cases in groups.values() for c in cases])
+    suite.run(Result())
+    if DEBUG:
+        t_end = os.times()
+        log(f"  child import {t_imp[0] + t_imp[1]:.2f}s run {t_end[0] + t_end[1] - t_imp[0] - t_imp[1]:.2f}s"
+            f" kids {t_end[2] + t_end[3]:.2f}s")
+    return {"bad": sorted(bad), "ok": sorted(ok - bad)}
+
+
+def run_tests(files, ids, timeout):
+    """_child_run's answer for the patched checkout, or None when that cannot be told."""
+    import select
+    import shutil
+    import signal
+    import time
+
+    farm = os.path.join(TMP, "br_farm")
+    shutil.rmtree(farm, ignore_errors=True)
+    try:
+        build_farm(farm, files)
+    except OSError as e:
+        log("farm:", e)
+        shutil.rmtree(farm, ignore_errors=True)
+        return None
+    r, w = os.pipe()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    pid = os.fork()
+    if pid == 0:
+        code = 1
+        try:
+            os.close(r)
+            os.setpgid(0, 0)
+            nul = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(nul, 1)
+            if not DEBUG:
+                os.dup2(nul, 2)
+            out = _child_run(farm, ids)
+            data = json.dumps(out).encode()
+            while data:
+                data = data[os.write(w, data):]
+            code = 0
+        except BaseException:
+            pass
+        os._exit(code)
+    os.close(w)
+    buf = b""
+    deadline = time.monotonic() + timeout
+    ok = True
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            ok = False
+            break
+        rd, _, _ = select.select([r], [], [], left)
+        if not rd:
+            continue
+        chunk = os.read(r, 65536)
+        if not chunk:
+            break
+        buf += chunk
+    os.close(r)
+    try:
+        os.killpg(pid, signal.SIGKILL)  # the child and anything it left running
+    except OSError:
+        pass
+    _, status = os.waitpid(pid, 0)
+    while True:  # orphans re-parented to us when we are pid 1
+        try:
+            if os.waitpid(-1, os.WNOHANG)[0] == 0:
+                break
+        except ChildProcessError:
+            break
+    shutil.rmtree(farm, ignore_errors=True)
+    if not ok or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+        return None
+    try:
+        return json.loads(buf)
+    except ValueError:
+        return None
+
+
 def main():
     tests = json.load(open(os.path.join(DATA, "tests.json")))["tests"]
     mp = Map(MAP)
@@ -874,35 +1159,78 @@ def main():
     for t in unknown:
         unknown_by_file.setdefault(t["file"], []).append((round(t["seconds"] * 1000), t["number"]))
 
+    num_id = {t["number"]: t["id"] for t in tests}
     cdir = os.path.join(DATA, "commits")
     out = []
+    import time
+    t_start = time.monotonic()
+    site_ready = heavy_ready = False
     for name in sorted(os.listdir(cdir)):
         if not name.endswith(".patch"):
             continue
         cid = name[: -len(".patch")]
         why = []
+        tree = {}
         try:
             with open(os.path.join(cdir, name), encoding="utf-8", errors="replace", newline="") as f:
                 text = f.read()
-            mask = patch_tests(mp, text, why)
+            mask = patch_tests(mp, text, why, tree)
         except Exception as e:
             why.append(f"fatal:{e!r}")
+            tree["!"] = True
             mask = mp.all
         items = []
         files = set()
-        i = 0
-        mm = mask
-        while mm:
-            if mm & 1:
-                info = bit_info[i]
-                if info is not None:
-                    items.append(info)
-                    files.add(mp.tests[i].split("::")[0])
-            mm >>= 1
-            i += 1
+        s = bin(mask)[:1:-1]
+        i = s.find("1")
+        while i >= 0:
+            info = bit_info[i]
+            if info is not None:
+                items.append(info)
+                files.add(mp.tests[i].split("::")[0])
+            i = s.find("1", i + 1)
         if unknown and mask:
             for f in files:
                 items.extend(unknown_by_file.get(f, ()))
+        load = sum(ms for ms, _ in items)
+        if (VERIFY and items and verify_cost(items, num_id) <= VERIFY_SHARE * ci_cost(items)
+                and load <= VERIFY_MAX_MS and tree.get("py") and "!" not in tree
+                and not tree.get("data")
+                and hasattr(os, "fork") and time.monotonic() - t_start < VERIFY_BUDGET_S):
+            if not site_ready:
+                site_ready = True
+                import site
+                site.main()
+                # loaded once here, inherited by every forked run
+                for mod in ("unittest", "multiprocessing", "concurrent.futures"):
+                    try:
+                        __import__(mod)
+                    except Exception:
+                        pass
+            stems = {os.path.basename(k)[:-3] for k in tree if k.endswith(".py")}
+            ids = [num_id[n] for _, n in sorted(items, key=lambda x: (not _near(num_id[x[1]], stems), x[0]))]
+            dur = {n: ms for ms, n in items}
+            id_num = {num_id[n]: n for _, n in items}
+            files_map = {k: v for k, v in tree.items() if k not in META}
+            if not heavy_ready and any(t.startswith(("tests/test_optimizer.py", "tests/test_executor.py")) for t in ids):
+                heavy_ready = True
+                for mod in ("duckdb", "pandas"):  # loaded once here, inherited by every forked run
+                    try:
+                        __import__(mod)
+                    except Exception:
+                        pass
+            t0 = time.monotonic()
+            res = run_tests(files_map, ids, timeout=3 + 3 * verify_cost(items, num_id) / 1000)
+            if res is not None and isinstance(res, dict):
+                why.append(f"verified:bad={len(res['bad'])},ok={len(res['ok'])}/{len(ids)}:{time.monotonic() - t0:.2f}s")
+                if res["bad"]:
+                    # a failure: keep the selection, less the tests seen passing
+                    okset = {id_num[t] for t in res["ok"] if t in id_num}
+                    items = [x for x in items if x[1] not in okset]
+                elif len(res["ok"]) == len(ids):
+                    items = []
+            else:
+                why.append("verify-failed")
         workers = pack(items)
         out.append(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")))
         if DEBUG:
