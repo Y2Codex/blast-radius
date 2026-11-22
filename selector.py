@@ -939,7 +939,7 @@ def pack(items):
 META = ("!", "data", "py", "lines", "text")
 VERIFY_MAX_MS = int(os.environ.get("BR_VERIFY_MAX_MS", "6000"))   # recorded seconds of the selection
 VERIFY_BUDGET_S = float(os.environ.get("BR_VERIFY_BUDGET_S", "110"))  # wall clock for all verifying
-VERIFY = os.environ.get("BR_VERIFY", "1") == "1"
+VERIFY = os.environ.get("BR_VERIFY", "0") == "1"  # off: on the practice board it cost about as much CPU as it saved
 TMP = os.environ.get("BR_TMP", "/tmp")
 
 
@@ -983,7 +983,7 @@ HEAVY = {
     "tests/test_parser.py::TestParser::test_max_nodes": ("max_nodes", "_node_count", "MAX_NODES"),
     "tests/test_executor.py::TestExecutor::test_execute_tpcds": ("tpcds", "_mp_execute", "TPCDS"),
 }
-HEAVY_SKIP = os.environ.get("BR_HEAVY_SKIP", "1") == "1"
+HEAVY_SKIP = os.environ.get("BR_HEAVY_SKIP", "0") == "1"  # off: a change that only slows code down passes the cheap tests and times the slow one out
 HEAVY_SUPPORT = int(os.environ.get("BR_HEAVY_SUPPORT", "5"))
 HEAVY_REST_MS = int(os.environ.get("BR_HEAVY_REST_MS", "15000"))  # cheap part worth running to drop one
 
