@@ -449,6 +449,11 @@ def import_time_tests(mp, path, stmt, chain, changed_node, why, new_node=None):
         if users is not None:
             c = classes[-1]
             users |= mp.start(path, c.lineno + 1, c.end_lineno)
+            if changed_node is stmt and isinstance(stmt, ast.ClassDef):
+                # the class itself renamed, removed or replaced: code that names it breaks too,
+                # at import when a module-level table lists it
+                users |= mp.ref(stmt.name) or 0
+                why.append("class-name")
             tests &= users
             why.append("class-users")
     # dict entry keyed by an expression class
@@ -476,6 +481,40 @@ def import_time_tests(mp, path, stmt, chain, changed_node, why, new_node=None):
             tests &= rm
             why.append("refs")
     return tests
+
+
+_DEF_SITES = {}
+
+
+def same_named_callers(mp, name):
+    """Tests that entered any method called `name` in the pinned commit, or None when there is
+    no such method. A method added under that name overrides or shadows one of them, and the
+    generator reaches its <x>_sql methods by a built name that no code spells."""
+    if not _DEF_SITES:
+        import re
+        pat = re.compile(r"^\s+(?:async\s+)?def\s+(\w+)\s*\(", re.M)
+        root = os.path.join(REPO, "sqlglot")
+        for dp, _, fn in os.walk(root):
+            for f in fn:
+                if not f.endswith(".py"):
+                    continue
+                full = os.path.join(dp, f)
+                try:
+                    with open(full, encoding="utf-8", newline="") as fh:
+                        text = fh.read()
+                except (OSError, UnicodeDecodeError):
+                    continue
+                rel = os.path.relpath(full, REPO).replace(os.sep, "/")
+                for m in pat.finditer(text):
+                    _DEF_SITES.setdefault(m.group(1), []).append((rel, text.count(chr(10), 0, m.start(1)) + 1))
+        _DEF_SITES[""] = []
+    sites = _DEF_SITES.get(name)
+    if not sites:
+        return None
+    r = 0
+    for rel, line in sites:
+        r |= mp.start(rel, max(1, line - 6), line)  # a decorated def starts at its first decorator
+    return r
 
 
 def dict_entry_key(stmt, changed_node):
@@ -544,6 +583,17 @@ def change_tests(mp, path, ch, why):
             rm = 0
             for nm in names:
                 rm |= mp.ref(nm) or 0
+            if classes:
+                for st in new_stmts:
+                    if not isinstance(st, DEFS):
+                        continue
+                    same = same_named_callers(mp, st.name)
+                    if same is not None:
+                        rm |= same  # whoever reached the method it overrides or shadows
+                        why.append("override")
+                    elif st.name.endswith("_sql"):
+                        rm = mp.all  # a new generator method: looked up by a built name
+                        why.append("new-sql-method")
             if not any(nm.startswith("__") for nm in names):
                 m &= rm
         why.append("insert-toplevel")
