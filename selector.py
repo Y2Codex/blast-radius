@@ -848,6 +848,20 @@ def file_tests(mp, old, new, hunks, flags, w, tree=None):
         w.append("rename")
     if changed:
         m |= structural_tests(mp, old, new, old_text, new_text, semantic, w)
+    if tree is not None and old:
+        ch, txt = tree.setdefault("lines", {}).setdefault(old, set()), tree.setdefault("text", [])
+        for ostart, body in hunks:
+            pos = ostart if any(t != "+" for t, _, _ in body) else ostart + 1
+            for tag, line, _ in body:
+                if tag == " ":
+                    pos += 1
+                elif tag == "-":
+                    ch.add(pos)
+                    txt.append(line)
+                    pos += 1
+                else:
+                    ch.update((pos - 1, pos))
+                    txt.append(line)
     if tree is not None:
         if "missing-old" in w or "binary" in w or "mode" in flags or (new and new_text is None):
             tree["!"] = True
@@ -922,7 +936,7 @@ def pack(items):
 # only what fails. The checkout is a symlink farm over REPO with the patched files written in;
 # the tests run with unittest (every sqlglot test is a unittest.TestCase) in a forked child.
 
-META = ("!", "data", "py")
+META = ("!", "data", "py", "lines", "text")
 VERIFY_MAX_MS = int(os.environ.get("BR_VERIFY_MAX_MS", "6000"))   # recorded seconds of the selection
 VERIFY_BUDGET_S = float(os.environ.get("BR_VERIFY_BUDGET_S", "110"))  # wall clock for all verifying
 VERIFY = os.environ.get("BR_VERIFY", "1") == "1"
@@ -959,6 +973,63 @@ def _near(tid, stems):
     f = tid.split("::")
     base = os.path.basename(f[0])[5:-3]
     return base in stems or any(f[-1] == "test_" + st for st in stems)
+
+
+# Tests too slow to run here (test_max_nodes takes longer than its 29 recorded seconds). One is
+# left out only when every cheap test of the selection passed on the patched checkout, each
+# changed statement was run by at least HEAVY_SUPPORT of those passing tests, and the change
+# does not touch what the slow test is about.
+HEAVY = {
+    "tests/test_parser.py::TestParser::test_max_nodes": ("max_nodes", "_node_count", "MAX_NODES"),
+    "tests/test_executor.py::TestExecutor::test_execute_tpcds": ("tpcds", "_mp_execute", "TPCDS"),
+}
+HEAVY_SKIP = os.environ.get("BR_HEAVY_SKIP", "1") == "1"
+HEAVY_SUPPORT = int(os.environ.get("BR_HEAVY_SUPPORT", "5"))
+HEAVY_REST_MS = int(os.environ.get("BR_HEAVY_REST_MS", "15000"))  # cheap part worth running to drop one
+
+
+def _innermost_stmt(tree, line):
+    best = None
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.stmt, ast.ExceptHandler)) and n.lineno <= line <= (n.end_lineno or n.lineno):
+            if best is None or (n.end_lineno - n.lineno) <= (best.end_lineno - best.lineno):
+                best = n
+    return best
+
+
+def heavy_droppable(mp, tree, tid, ok_mask):
+    """May the slow test tid be left out, given the cheap tests in ok_mask passed?"""
+    text = "\n".join(tree.get("text", ()))
+    if any(g in text for g in HEAVY[tid]):
+        return False
+    lines = tree.get("lines", {})
+    if not lines:
+        return False
+    for path, changed in lines.items():
+        if not (path.startswith("sqlglot/") and path.endswith(".py")) or path not in mp.lines:
+            return False
+        src = read_repo(path)
+        if src is None:
+            return False
+        try:
+            mod = ast.parse(src)
+        except SyntaxError:
+            return False
+        src_lines = src.split("\n")
+        for ln in changed:
+            if ln < 1 or ln > len(src_lines):
+                continue
+            st = _innermost_stmt(mod, ln)
+            if st is None:
+                if src_lines[ln - 1].strip() and not src_lines[ln - 1].strip().startswith("#"):
+                    return False
+                continue
+            a, b = own_lines(st)
+            if isinstance(st, (ast.ClassDef,) + DEFS) and not (a <= ln <= b):
+                continue  # a blank or comment line inside a body
+            if bin(mp.line(path, a, b) & ok_mask).count("1") < HEAVY_SUPPORT:
+                return False
+    return True
 
 
 def build_farm(dst, files):
@@ -1160,6 +1231,7 @@ def main():
         unknown_by_file.setdefault(t["file"], []).append((round(t["seconds"] * 1000), t["number"]))
 
     num_id = {t["number"]: t["id"] for t in tests}
+    mp_index = {t: i for i, t in enumerate(mp.tests)}
     cdir = os.path.join(DATA, "commits")
     out = []
     import time
@@ -1192,9 +1264,20 @@ def main():
         if unknown and mask:
             for f in files:
                 items.extend(unknown_by_file.get(f, ()))
+        all_items = items
+        heavy = [x for x in items if num_id[x[1]] in HEAVY] if HEAVY_SKIP and VERIFY else []
+        fixed = []  # slow tests that stay whatever the cheap ones do
+        if heavy:
+            rest_mask = 0
+            for _, n in items:
+                if num_id[n] not in HEAVY and num_id[n] in mp_index:
+                    rest_mask |= 1 << mp_index[num_id[n]]
+            fixed = [x for x in heavy if not heavy_droppable(mp, tree, num_id[x[1]], rest_mask)]
+            heavy = [x for x in heavy if x not in fixed]
+            items = [x for x in items if x not in heavy and x not in fixed]
         load = sum(ms for ms, _ in items)
-        if (VERIFY and items and verify_cost(items, num_id) <= VERIFY_SHARE * ci_cost(items)
-                and load <= VERIFY_MAX_MS and tree.get("py") and "!" not in tree
+        if (VERIFY and items and verify_cost(items, num_id) <= VERIFY_SHARE * (ci_cost(all_items) - ci_cost(fixed))
+                and load <= (HEAVY_REST_MS if heavy else VERIFY_MAX_MS) and tree.get("py") and "!" not in tree
                 and not tree.get("data")
                 and hasattr(os, "fork") and time.monotonic() - t_start < VERIFY_BUDGET_S):
             if not site_ready:
@@ -1226,11 +1309,23 @@ def main():
                 if res["bad"]:
                     # a failure: keep the selection, less the tests seen passing
                     okset = {id_num[t] for t in res["ok"] if t in id_num}
-                    items = [x for x in items if x[1] not in okset]
+                    items = [x for x in items if x[1] not in okset] + heavy + fixed
                 elif len(res["ok"]) == len(ids):
-                    items = []
+                    ok_mask = 0
+                    for t in res["ok"]:
+                        if t in mp_index:
+                            ok_mask |= 1 << mp_index[t]
+                    kept = [x for x in heavy if not heavy_droppable(mp, tree, num_id[x[1]], ok_mask)]
+                    if heavy:
+                        why.append(f"heavy:{len(heavy) - len(kept)}-dropped")
+                    items = kept + fixed
+                else:
+                    items = items + heavy + fixed
             else:
                 why.append("verify-failed")
+                items = items + heavy + fixed
+        else:
+            items = all_items
         workers = pack(items)
         out.append(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")))
         if DEBUG:
