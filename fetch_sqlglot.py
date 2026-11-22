@@ -1,9 +1,21 @@
 """Build step: unpack sqlglot at the pinned commit into /opt/sqlglot (text files only)."""
-import io, os, tarfile, urllib.request
+import io, os, sys, tarfile, time, urllib.request
 
 SHA = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
 DEST = "/opt/sqlglot"
-data = urllib.request.urlopen(f"https://github.com/tobymao/sqlglot/archive/{SHA}.tar.gz", timeout=120).read()
+URL = f"https://github.com/tobymao/sqlglot/archive/{SHA}.tar.gz"
+data = None
+for attempt in range(5):  # one dropped connection must not cost the build
+    try:
+        data = urllib.request.urlopen(URL, timeout=60).read()
+        tarfile.open(fileobj=io.BytesIO(data)).getmembers()  # a cut-off download fails here
+        break
+    except Exception as e:
+        print(f"fetch attempt {attempt + 1} failed: {e!r}", file=sys.stderr)
+        data = None
+        time.sleep(5 * (attempt + 1))
+if data is None:
+    sys.exit("could not download sqlglot at the pinned commit")
 os.makedirs(DEST)
 with tarfile.open(fileobj=io.BytesIO(data)) as tar:
     for m in tar.getmembers():
