@@ -280,7 +280,9 @@ def node_eq(a, b):
     """Same tree, positions aside: what comparing ast.dump() of both would say, without building the strings."""
     if type(a) is not type(b):
         return False
-    if isinstance(a, ast.stmt) and _same_text(a, b):
+    # A def or class starts at its keyword, so its decorators are outside the compared text.
+    if (isinstance(a, ast.stmt) and not getattr(a, "decorator_list", None)
+            and not getattr(b, "decorator_list", None) and _same_text(a, b)):
         return True
     if isinstance(a, ast.AST):
         for f in a._fields:
@@ -608,7 +610,15 @@ def change_tests(mp, path, ch, why):
         entered = func_start_mask(mp, path, fn)
         lm = mp.line(path, a, b)
         return entered & lm if entered else lm
-    return import_time_tests(mp, path, stmt, outer, node, why, ch.new)
+    m = import_time_tests(mp, path, stmt, outer, node, why, ch.new)
+    if isinstance(stmt, DEFS) and node is stmt:
+        # A def renamed, removed or re-decorated: whoever called it sees the change, even when
+        # no code names it (Generator.<x>_sql and the like are looked up by a built name).
+        callers = func_start_mask(mp, path, stmt)
+        if callers & ~m:
+            why.append("def-callers")
+        m |= callers
+    return m
 
 
 _SWAPS = {(ast.Is, ast.Eq), (ast.Eq, ast.Is), (ast.IsNot, ast.NotEq), (ast.NotEq, ast.IsNot)}
