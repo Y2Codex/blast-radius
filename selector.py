@@ -583,15 +583,16 @@ ENUMS = {"TokenType", "DType", "Type", "ErrorLevel", "IsPredicatePrecedence", "P
 
 
 def identity_swap(ch):
-    """`x is None` <-> `x == None`, and the same against True, False or an enum member, behave the
-    same. Other upper-case attributes (string constants such as Drill.DATE_FORMAT) do not."""
+    """`x is None` <-> `x == None`, and the same against an enum member, behave the same.
+    True and False do not (0 == False), nor do other upper-case attributes, which may be
+    string constants such as Drill.DATE_FORMAT."""
     if (type(ch.node), type(ch.new)) not in _SWAPS or not ch.chain:
         return False
     cmp_, field = ch.chain[-1]
     if not isinstance(cmp_, ast.Compare) or field != "ops" or len(cmp_.ops) != 1:
         return False
     for side in (cmp_.comparators[0], cmp_.left):
-        if isinstance(side, ast.Constant) and (side.value is None or side.value is True or side.value is False):
+        if isinstance(side, ast.Constant) and side.value is None:
             return True
         if isinstance(side, ast.Attribute) and isinstance(side.value, (ast.Name, ast.Attribute)) and side.attr.isupper():
             owner = side.value.id if isinstance(side.value, ast.Name) else side.value.attr
